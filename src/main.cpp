@@ -11,6 +11,7 @@
 #include "common.h"
 
 using namespace K;
+static bool g_cli = false;   // non-interactive mode (used by the GUI)
 
 // ------------------------------------------------------------------ knowledge
 static const std::set<std::string> RISKY_NAMES = {"android", "com.android.systemui", "com.android.phone", "com.android.settings",
@@ -96,7 +97,7 @@ static void actUnpack(Project& P, std::string src = "", int growMb = -1) {
     run({"e2fsck", "-fy", P.img}); auto info = fsInfo(P.img);
     P.orig_bytes = fileSize(P.img); P.orig_blocks = info.blocks; P.bs = info.bs; P.removed.clear(); P.added.clear();
     bool shared = info.features.find("shared_blocks") != std::string::npos;
-    if (growMb < 0) growMb = atoi(ask("extra free space to add while editing (MB, shrunk back on repack)", shared ? "800" : "256").c_str());
+    if (growMb < 0) growMb = g_cli ? (shared ? 800 : 256) : atoi(ask("extra free space to add while editing (MB, shrunk back on repack)", shared ? "800" : "256").c_str());
     if (growMb > 0) {
         if (truncate(P.img.c_str(), (off_t)(P.orig_bytes + (uint64_t)growMb * 1024 * 1024)) != 0) { err("cannot grow image"); return; }
         auto r = run({"resize2fs", P.img}); if (r.rc != 0) { err("resize2fs failed:\n" + r.err + r.out); return; }
@@ -115,7 +116,7 @@ static void actUnpack(Project& P, std::string src = "", int growMb = -1) {
 
 struct AppItem {
     std::string path, name, pkg, shared, why; uint64_t size = 0; bool isdir = false, risky = false;
-    std::vector<std::string> libs, dirs, files, mates, neededby;
+    std::vector<std::string> libs, dirs, files, mates, neededby, needs;
 };
 static std::string join(const std::vector<std::string>& v, const std::string& sep, size_t cap = 100) {
     std::string s; for (size_t i = 0; i < v.size() && i < cap; i++) { if (i) s += sep; s += v[i]; } return s;
@@ -158,6 +159,8 @@ static std::vector<AppItem> scanApps(Project& P) {
     for (auto& it : items) {
         std::set<std::string> nb; for (auto& o : items) if (&o != &it && !it.pkg.empty() && std::find(o.libs.begin(), o.libs.end(), it.pkg) != o.libs.end()) nb.insert(o.name);
         it.neededby.assign(nb.begin(), nb.end());
+        std::set<std::string> nd; for (auto& o : items) if (&o != &it && !o.pkg.empty() && std::find(it.libs.begin(), it.libs.end(), o.pkg) != it.libs.end()) nd.insert(o.name);
+        it.needs.assign(nd.begin(), nd.end());
         if (!it.neededby.empty()) { it.risky = true; it.why = "needed by " + join(it.neededby, ", ", 4); }
         if (startsWith(it.shared, "android.uid.")) { if (!it.why.empty()) it.why += " "; it.why += "shared system UID " + it.shared; }
     }
@@ -260,22 +263,27 @@ static void actAdd(Project& P) {
     bool priv = ask("install as privileged system app (priv-app)? y/N", "n")[0] == 'y';
     for (auto& f : files) { if (!fileExists(f)) { err("missing " + f); continue; } putApp(P, f, priv); }
 }
-static void actProp(Project& P) {
-    if (!P.have()) { err("unpack first"); return; }
+static bool setProp(Project& P, const std::string& k, const std::string& v) {
     std::string path = P.prefix + "/build.prop"; auto b = readFileIn(P.img, path); std::string txt(b.begin(), b.end());
-    std::string k = ask("property to set (e.g. ro.product.model) or 'fp' to bump the fingerprint"); if (k.empty()) return; std::string v;
-    if (k == "fp") {
-        std::stringstream ss(txt); std::string l, cur; while (std::getline(ss, l)) if (startsWith(l, "ro.build.fingerprint=")) cur = l.substr(21);
-        if (cur.empty()) { err("no fingerprint in build.prop"); return; }
-        size_t m = cur.rfind("-mux"); if (m != std::string::npos) cur = cur.substr(0, m);
-        k = "ro.build.fingerprint"; v = cur + "-mux" + std::to_string(P.added.size() + 1); say("new fingerprint: " + v, AM);
-    } else v = ask("value");
+    if (txt.empty()) { err("cannot read " + path); return false; }
     std::stringstream ss(txt); std::string l, out; bool done = false;
     while (std::getline(ss, l)) { if (startsWith(l, k + "=")) { out += k + "=" + v + "\n"; done = true; } else out += l + "\n"; }
     if (!done) out += k + "=" + v + "\n";
     std::string tmpd = makeTempDir(), tmp = tmpd + "/build.prop", ctxf = tmpd + "/ctx.bin"; writeText(tmp, out); writeAll(ctxf, Bytes(CTX, CTX + sizeof CTX));
     std::vector<std::string> cmds = {"rm " + q(path), "write " + q(tmp) + " " + q(path)}; setMeta(cmds, path, "0100644", ctxf);
-    dbg(P.img, cmds, true); removeAll(tmpd); ok(k + "=" + v + " written");
+    dbg(P.img, cmds, true); removeAll(tmpd); ok(k + "=" + v + " written"); return true;
+}
+static bool bumpFp(Project& P) {
+    auto b = readFileIn(P.img, P.prefix + "/build.prop"); std::stringstream ss(std::string(b.begin(), b.end())); std::string l, cur;
+    while (std::getline(ss, l)) if (startsWith(l, "ro.build.fingerprint=")) cur = l.substr(21);
+    if (cur.empty()) { err("no fingerprint in build.prop"); return false; }
+    size_t m = cur.rfind("-mux"); if (m != std::string::npos) cur = cur.substr(0, m);
+    std::string v = cur + "-mux" + std::to_string(P.added.size() + 1); say("new fingerprint: " + v, AM); return setProp(P, "ro.build.fingerprint", v);
+}
+static void actProp(Project& P) {
+    if (!P.have()) { err("unpack first"); return; }
+    std::string k = ask("property to set (e.g. ro.product.model) or 'fp' to bump the fingerprint"); if (k.empty()) return;
+    if (k == "fp") bumpFp(P); else setProp(P, k, ask("value"));
 }
 static void actFlash() {
     box("FLASH (fastboot, bootloader unlocked)", {c(AM, "1) verification off (pick one):"),
@@ -300,11 +308,62 @@ static void actRepack(Project& P) {
     actFlash();
 }
 
-int main(int argc, char** argv) {
-    std::string root = argc > 1 ? argv[1] : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/system-kitchen/project1";
-    // non-interactive helper used by the tests:  kitchen <project> --unpack <img> <growMB>
-    std::vector<std::string> miss; for (auto t : {"debugfs", "e2fsck", "resize2fs", "dumpe2fs"}) if (!haveTool(t)) miss.push_back(t);
-    system(("mkdir -p '" + root + "'").c_str()); Project P(root);
+// ------------------------------------------------------------------ non-interactive commands (GUI)
+static std::string tabs(const std::vector<std::string>& v) { return join(v, ";"); }
+static std::string oneLine(std::string s) { for (auto& ch : s) if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' '; return s; }
+static void cmdStatus(Project& P) {
+    auto line = [](const std::string& k, const std::string& v) { std::cout << "#STATUS\t" << k << "\t" << oneLine(v) << "\n"; };
+    line("project", P.root); line("image loaded", P.have() ? "yes" : "no");
+    if (!P.have()) return;
+    auto i = fsInfo(P.img);
+    line("original size", human(P.orig_bytes)); line("working fs", human(i.blocks * i.bs) + ", free " + human(i.free * i.bs));
+    line("features", i.features); line("app root", P.prefix.empty() ? "/" : P.prefix);
+    line("apps removed", std::to_string(P.removed.size())); line("apps added", std::to_string(P.added.size()));
+    auto bp = readFileIn(P.img, P.prefix + "/build.prop"); std::stringstream ss(std::string(bp.begin(), bp.end())); std::string l;
+    while (std::getline(ss, l)) for (auto k : {"ro.build.display.id", "ro.build.version.release", "ro.build.fingerprint", "ro.product.model", "ro.product.name", "ro.product.device", "ro.product.brand"})
+        if (startsWith(l, std::string(k) + "=")) line(k, l.substr(strlen(k) + 1));
+}
+static void cmdDoctor() {
+    for (auto t : {"debugfs", "e2fsck", "resize2fs", "dumpe2fs", "sha256sum"}) std::cout << "#TOOL\t" << t << "\t" << (haveTool(t) ? "ok" : "MISSING") << "\n";
+    say("tools: sudo apt install -y e2fsprogs coreutils", DM);
+}
+static void cmdList(Project& P) {
+    if (!P.have()) { err("unpack first"); return; }
+    for (auto& it : scanApps(P))
+        std::cout << "#APP\t" << it.path << "\t" << it.name << "\t" << it.pkg << "\t" << it.size << "\t" << (it.risky ? 1 : 0) << "\t" << it.shared << "\t"
+                  << tabs(it.needs) << "\t" << tabs(it.neededby) << "\t" << tabs(it.mates) << "\t" << oneLine(it.why) << "\n";
+}
+static void cmdDelete(Project& P, const std::vector<std::string>& paths) {
+    if (!P.have()) { err("unpack first"); return; }
+    std::vector<std::string> cmds;
+    for (auto& p : paths) {
+        size_t sl = p.find_last_of('/'); std::string par = sl == 0 ? "/" : p.substr(0, sl), nm = p.substr(sl + 1); char kind = 0;
+        auto lm = lsDir(P.img, {par}); for (auto& e : lm[par]) if (e.name == nm) kind = e.kind;
+        if (!kind) { err("not found: " + p); continue; }
+        if (kind == 'd') { auto t = walk(P.img, {p})[p]; for (auto& f : t.files) cmds.push_back("rm " + q(f.first));
+            std::sort(t.dirs.begin(), t.dirs.end(), [](const std::string& a, const std::string& b) { return std::count(a.begin(), a.end(), '/') > std::count(b.begin(), b.end(), '/'); });
+            for (auto& d : t.dirs) cmds.push_back("rmdir " + q(d)); }
+        else cmds.push_back("rm " + q(p));
+    }
+    if (cmds.empty()) return;
+    dbg(P.img, cmds, true);
+    std::string log; for (auto& p : paths) { if (existsIn(P.img, p)) err("could not delete " + p); else { ok("deleted " + p); P.removed.push_back(p); } }
+    P.save(); for (auto& x : P.removed) log += x + "\n"; writeText(P.root + "/out/removed_apps.txt", log);
+}
+static void cmdExport(Project& P, const std::string& dest) {
+    system(("mkdir -p '" + dest + "'").c_str()); bool any = false;
+    for (auto n : {"system_custom.img", "system_custom.raw.img"}) { std::string src = P.root + "/out/" + n; if (fileExists(src)) { if (copyFile(src, dest + "/" + n)) { ok("exported " + dest + "/" + n); any = true; } else err("copy failed: " + src); } }
+    if (!any) err("nothing to export - repack first");
+}
+
+static std::string resolveProject(const std::string& a) {
+    std::string home = getenv("HOME") ? getenv("HOME") : ".";
+    if (a.empty()) return home + "/system-kitchen/project1";
+    if (a[0] == '~') return home + a.substr(1);
+    if (a.find('/') != std::string::npos) return a;
+    return home + "/system-kitchen/" + a;
+}
+static void menuLoop(Project& P, const std::vector<std::string>& miss) {
     while (true) {
         banner();
         std::vector<std::string> pl = {P.root, std::string("state: ") + (P.have() ? "image loaded" : "empty - choose 1")};
@@ -315,6 +374,31 @@ int main(int argc, char** argv) {
         for (auto& m : menu) std::cout << c(AM, std::string(" ") + m[0] + " ") << c(CY, m[1]) << "\n";
         std::string ch = ask("select");
         if (ch == "1") actUnpack(P); else if (ch == "2") actInfo(P); else if (ch == "3") actDelete(P); else if (ch == "4") actAdd(P);
-        else if (ch == "5") actProp(P); else if (ch == "6") actRepack(P); else if (ch == "7") actFlash(); else if (ch == "0" || (ch.empty() && !std::cin)) return 0;
+        else if (ch == "5") actProp(P); else if (ch == "6") actRepack(P); else if (ch == "7") actFlash(); else if (ch == "0" || (ch.empty() && !std::cin)) return;
     }
+}
+
+int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IOLBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
+    std::string projArg; std::vector<std::string> rest;
+    for (int i = 1; i < argc; i++) { std::string a = argv[i]; if (a == "--project" && i + 1 < argc) projArg = argv[++i]; else rest.push_back(a); }
+    std::string root = resolveProject(projArg);
+    std::vector<std::string> miss; for (auto t : {"debugfs", "e2fsck", "resize2fs", "dumpe2fs"}) if (!haveTool(t)) miss.push_back(t);
+    if (system(("mkdir -p '" + root + "'").c_str()) != 0) {}
+    Project P(root);
+    if (rest.empty()) { menuLoop(P, miss); return 0; }
+    g_cli = true; const std::string cmd = rest[0]; std::vector<std::string> a(rest.begin() + 1, rest.end());
+    if (cmd == "doctor") cmdDoctor();
+    else if (!miss.empty() && cmd != "status") { err("missing tools: " + join(miss, ", ") + "  ->  sudo apt install -y e2fsprogs"); }
+    else if (cmd == "status") cmdStatus(P);
+    else if (cmd == "unpack") { if (a.empty()) err("usage: unpack <system.img> [extraMB]"); else actUnpack(P, a[0], a.size() > 1 ? atoi(a[1].c_str()) : -1); }
+    else if (cmd == "list") cmdList(P);
+    else if (cmd == "delete") cmdDelete(P, a);
+    else if (cmd == "add") { bool priv = false; std::vector<std::string> files; for (auto& x : a) { if (x == "--priv") priv = true; else files.push_back(x); }
+        if (!P.have()) err("unpack first"); else for (auto& f : files) { if (!fileExists(f)) err("missing " + f); else putApp(P, f, priv); } }
+    else if (cmd == "prop") { if (!P.have()) err("unpack first"); else if (a.size() == 1 && a[0] == "fp") bumpFp(P); else if (a.size() >= 2) setProp(P, a[0], a[1]); else err("usage: prop <key> <value> | prop fp"); }
+    else if (cmd == "repack") actRepack(P);
+    else if (cmd == "export") { if (a.empty()) err("usage: export <dest folder>"); else cmdExport(P, a[0]); }
+    else err("unknown command: " + cmd);
+    return g_failed ? 1 : 0;
 }

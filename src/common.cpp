@@ -17,12 +17,13 @@ namespace K {
 
 const char *CY = "38;2;0;229;255", *AM = "38;2;255;179;0", *RD = "38;2;255;61;87", *DM = "38;2;107;135;148",
            *WH = "38;2;226;238;244", *GR = "38;2;80;230;140";
+bool g_failed = false;
 static bool tty() { return isatty(1); }
 std::string c(const char* code, const std::string& t) { return tty() ? std::string("\x1b[") + code + "m" + t + "\x1b[0m" : t; }
 void say(const std::string& t, const char* col) { std::cout << c(col ? col : WH, t) << "\n"; }
 void ok(const std::string& t) { std::cout << c(GR, "[ OK ] ") << t << "\n"; }
 void warn(const std::string& t) { std::cout << c(AM, "[WARN] ") << t << "\n"; }
-void err(const std::string& t) { std::cout << c(RD, "[FAIL] ") << t << "\n"; }
+void err(const std::string& t) { g_failed = true; std::cout << c(RD, "[FAIL] ") << t << "\n"; }
 static size_t vlen(const std::string& s) { size_t n = 0; for (unsigned char ch : s) if ((ch & 0xC0) != 0x80) n++; return n; }
 void box(const std::string& title, const std::vector<std::string>& lines, const char* col, int width) {
     col = col ? col : CY;

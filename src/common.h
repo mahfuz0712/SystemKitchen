@@ -8,6 +8,8 @@
 namespace K {
 typedef std::vector<uint8_t> Bytes;
 
+extern bool g_failed;   // set by err(); used for the process exit code
+
 // ---- HUD look
 extern const char *CY, *AM, *RD, *DM, *WH, *GR;
 std::string c(const char* code, const std::string& t);

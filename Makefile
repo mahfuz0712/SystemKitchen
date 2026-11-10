@@ -1,31 +1,18 @@
-APP      := kitchen
-SRC_DIR  := src
-OBJ_DIR  := build/obj
-DIST_DIR := dist
-TARGET   := $(DIST_DIR)/$(APP)
+CXX ?= g++
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
+GTK_CFLAGS := $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
+GTK_LIBS := $(shell pkg-config --libs gtk+-3.0 2>/dev/null)
 
-CXX      := g++
-CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -MMD -MP
-LDLIBS   := -lz
+all: dist/kitchen gui
 
-SRCS := $(wildcard $(SRC_DIR)/*.cpp)
-OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
+dist/kitchen: src/common.cpp src/apk.cpp src/main.cpp src/common.h src/apk.h
+	@mkdir -p dist
+	$(CXX) $(CXXFLAGS) -o $@ src/common.cpp src/apk.cpp src/main.cpp -lz
 
-.PHONY: all run clean rebuild
-all: $(TARGET)
+gui: dist/kitchen
+	@if [ -z "$(GTK_LIBS)" ]; then echo "GTK3 dev files missing. Run: sudo apt install libgtk-3-dev pkg-config  then: make"; exit 1; fi
+	$(CXX) $(CXXFLAGS) $(GTK_CFLAGS) -o dist/kitchen-gui src/gui_gtk.cpp $(GTK_LIBS) -pthread
 
-$(TARGET): $(OBJS) | $(DIST_DIR)
-	$(CXX) $(OBJS) -o $@ $(LDLIBS)
-
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(OBJ_DIR) $(DIST_DIR):
-	mkdir -p $@
-
-run: all
-	./$(TARGET)
 clean:
-	rm -rf build dist
-rebuild: clean all
--include $(OBJS:.o=.d)
+	rm -rf dist build
+.PHONY: all gui clean
